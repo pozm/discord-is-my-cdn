@@ -24,3 +24,6 @@ you can resume it by providing a channel id with the offset which you were on.
 
 if all of them are uploaded and you don't have an out.json in your CWD
 then you can run it with the -f flag to fetch all the images and make the out.json
+
+# cool alternatives 
+[cdn-slave by spinfal](https://github.com/spinfal/cdn-slave)
