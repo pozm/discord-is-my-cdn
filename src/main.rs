@@ -1,6 +1,7 @@
 use async_recursion::async_recursion;
 use clap::Parser;
 use futures::StreamExt;
+use rand::Rng;
 use reqwest::multipart::Part;
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
@@ -95,13 +96,12 @@ async fn upload_image(
     filep: &Path,
     api_ver: Option<i8>,
     auth: &str,
-) -> Result<Message, Response> {
+) -> Result<Message, Option<Response>> {
     let api = format!(
         "https://discordapp.com/api/v{}/channels/{}/messages",
         api_ver.unwrap_or(9),
         ch
     );
-    // let permit = client.semaphore.acquire().await.unwrap();
     let http = client;
     println!("uploading : {:?} @ {}", filep.file_name().unwrap(),api);
     let part = Part::bytes(fs::read(filep).unwrap()).file_name("poggers.png");
@@ -112,13 +112,12 @@ async fn upload_image(
         .header("authorization", auth)
         .send()
         .await
-        .unwrap();
-    // drop(permit);
+        .or(Err(None))?;
     if dat.status().is_success() {
         let dat = dat.json::<Message>().await.unwrap();
         Ok(dat)
     } else {
-        Err(dat)
+        Err(Some(dat))
     }
 }
 #[async_recursion]
@@ -142,42 +141,60 @@ match msg {
                 println!("too many attempts");
                 return Err(());
             }
-            match e.status().as_u16() {
-                429 => {
-                    // rate limit
-                    let text = e.text().await.unwrap_or("{}".to_string());
-                    let rate_limit = serde_json::from_str::<RateLimitError>(&text);
-                    match rate_limit {
-                        Ok(rl) => {
-                            println!("got rate limit {} | {}", rl.retry_after, text);
-                            std::thread::sleep(std::time::Duration::from_secs(
-                                (rl.retry_after as u64 + 10u64).min(20u64),
-                            ));
-                            return attempt_upload(
-                                client,
-                                ch,
-                                filep,
-                                api_ver,
-                                auth,
-                                Some(attempts.unwrap_or(0) + 1),
-                            )
-                            .await;
+
+            match e {
+                Some(e) => { // request was made
+                    match e.status().as_u16() {
+                        429 => {
+                            // rate limit
+                            let text = e.text().await.unwrap_or("{}".to_string());
+                            let rate_limit = serde_json::from_str::<RateLimitError>(&text);
+                            match rate_limit {
+                                Ok(rl) => {
+                                    println!("got rate limit {} | {}", rl.retry_after, text);
+                                    std::thread::sleep(std::time::Duration::from_secs(
+                                        (rl.retry_after as u64 + 10u64).min(20u64),
+                                    ));
+                                    return attempt_upload(
+                                        client,
+                                        ch,
+                                        filep,
+                                        api_ver,
+                                        auth,
+                                        Some(attempts.unwrap_or(0) + 1),
+                                    )
+                                    .await;
+                                }
+                                Err(er) => {
+                                    println!("{:?}, {:?}", er, text)
+                                }
+                            }
                         }
-                        Err(er) => {
-                            println!("{:?}, {:?}", er, text)
+                        413 => {
+                            // too big
+                            println!("File too big!");
+                            return Err(());
+                        }
+                        _ => {
+                            // other error
+                            println!("{:?}", e);
                         }
                     }
                 }
-                413 => {
-                    // too big
-                    println!("File too big!");
-                    return Err(());
-                }
-                _ => {
-                    // other error
-                    println!("{:?}", e);
+                None => { // request was not made
+                    println!("unable to make request??? retrying. {}",filep);
+                    return attempt_upload(
+                        client,
+                        ch,
+                        filep,
+                        api_ver,
+                        auth,
+                        Some(attempts.unwrap_or(0) + 1),
+                    )
+                    .await;
                 }
             }
+
         }
     }
     Err(())
@@ -229,7 +246,8 @@ async fn main() {
             } else {
                 format!("before={}", messages.last().unwrap().id)
             };
-            let data = http
+
+            match http
                 .get(
                     format!(
                         "{}channels/{}/messages?limit=100&{}",
@@ -239,18 +257,58 @@ async fn main() {
                 )
                 .header("authorization", args.token.as_str())
                 .send()
-                .await
-                .unwrap();
-            let messages_ = data.json::<Vec<Message>>().await.unwrap();
-            if messages_.len() == 0 {
-                break;
-            }
-            println!("{:?} | {}", messages_.len(), before);
-            messages.extend(messages_);
-            std::thread::sleep(std::time::Duration::from_secs(3));
+                .await {
+                    Ok(data) => {
+                        match data.status().is_success() {
+                            true => {
+                                let messages_ = data.json::<Vec<Message>>().await.unwrap();
+                                if messages_.len() == 0 {
+                                    break;
+                                }
+                                println!("{:?} | {}", messages_.len(), before);
+                                messages.extend(messages_);
+            
+                            }
+                            false => {
+                                match data.status().as_u16() {
+                                    429 => {
+                                        // rate limit
+                                        let text = data.text().await.unwrap_or("{}".to_string());
+                                        let rate_limit = serde_json::from_str::<RateLimitError>(&text);
+                                        match rate_limit {
+                                            Ok(rl) => {
+                                                println!("got rate limit {} | {}", rl.retry_after, text);
+                                                std::thread::sleep(std::time::Duration::from_secs(
+                                                    (rl.retry_after as u64 + 10u64).min(20u64),
+                                                ));
+                                            }
+                                            Err(er) => {
+                                                println!("{:?}, {:?}", er, text)
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        // other error
+                                        println!("another error {:?}", data.status().as_str());
+                                    }
+                                }
+                            }
+                        }
+
+                    }
+                    _=>{
+                        println!("failed to get messages");
+                    }
+                }
+
+            let mut rng = rand::thread_rng();
+            
+            let ms = rng.gen_range(0.3..1.0);
+
+            std::thread::sleep(std::time::Duration::from_millis((ms*1000f64).floor() as u64));
         }
 
-        let f = File::create("out.json").unwrap();
+        let f = File::create(format!("{}out.json",args.name)).unwrap();
         serde_json::to_writer_pretty(f, &messages).unwrap();
         return;
     }
@@ -313,6 +371,7 @@ async fn main() {
         // for req in reqs {
         //     println!("{:?}",req.await);
         // }
+        println!("new offset = {}", file_offset);
         std::thread::sleep(std::time::Duration::from_secs(7));
     }
     // let mut futures = vec![];
